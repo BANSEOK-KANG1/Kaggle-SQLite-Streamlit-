@@ -1,41 +1,37 @@
-# app.py 맨 위 import 아래쪽에 추가
-import subprocess
-
-DB_PATH = Path("data/olist.sqlite")
-if not DB_PATH.exists():
-    st.warning("⚙️ 데이터베이스가 없습니다. 자동 생성 중... (처음 1~2분 소요)")
-    try:
-        subprocess.run(
-            ["python", "scripts/etl.py", "--download", "--load"],
-            check=True
-        )
-        st.success("✅ 데이터베이스 생성 완료! 앱을 다시 실행하세요.")
-        st.stop()
-    except Exception as e:
-        st.error(f"DB 생성 실패: {e}")
-        st.stop()
-
-
-
-# app.py (핸들링 확장판)
+# app.py — Olist E-Commerce Explorer (Cloud-ready)
 from pathlib import Path
-import streamlit as st
 import subprocess
-import plotly.express as px
+
 import pandas as pd
+import plotly.express as px
+import streamlit as st
 from sqlalchemy import create_engine, text
 
-
-
+# ─────────────────────────────────────────────────────────────────────────────
+# 0) 초기 설정
+# ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Olist E-Commerce Explorer (Pro)", layout="wide")
+DATA_DIR = Path("data")
+DB_PATH = DATA_DIR / "olist.sqlite"
 
-DB_PATH = Path("data/olist.sqlite")
+# 데이터 폴더 보장
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) DB 부트스트랩: 없으면 자동 생성 (Kaggle Secrets 필요)
+# ─────────────────────────────────────────────────────────────────────────────
 if not DB_PATH.exists():
-    st.warning("데이터베이스가 없습니다. 먼저 `python scripts/etl.py --download --load` 를 실행하세요.")
+    st.warning("⚙️ 데이터베이스가 없습니다. 자동 생성 중… (최초 1~2분)")
+    try:
+        # Kaggle Secrets가 Cloud에 설정되어 있어야 함: [kaggle] username/key
+        subprocess.run(["python", "scripts/etl.py", "--download", "--load"], check=True)
+        st.success("✅ 데이터베이스 생성 완료! ▶ 상단 Rerun 버튼으로 다시 실행하세요.")
+    except Exception as e:
+        st.error(f"DB 생성 실패: {e}")
     st.stop()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 캐시: 엔진/쿼리
+# 2) 캐시 헬퍼(엔진/쿼리)
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_engine():
@@ -48,7 +44,7 @@ def q(sql: str, params: dict | None = None) -> pd.DataFrame:
         return pd.read_sql(text(sql), conn, params=params or {})
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 사이드바: 글로벌 필터 폼
+# 3) 사이드바: 글로벌 필터 (폼으로 리런 최소화)
 # ─────────────────────────────────────────────────────────────────────────────
 st.sidebar.header("🔧 글로벌 필터")
 
@@ -58,9 +54,7 @@ years_df = q("""
     WHERE order_purchase_timestamp IS NOT NULL
     ORDER BY 1
 """)
-years = years_df["y"].dropna().tolist()
-if not years:
-    years = ["2016", "2017", "2018"]
+years = years_df["y"].dropna().tolist() or ["2016", "2017", "2018"]
 
 states_df = q("""
     SELECT DISTINCT customer_state AS st
@@ -68,60 +62,60 @@ states_df = q("""
     WHERE customer_state IS NOT NULL
     ORDER BY 1
 """)
-state_all = states_df["st"].dropna().tolist()
+all_states = states_df["st"].dropna().tolist()
 
 with st.sidebar.form("filters", clear_on_submit=False):
     y_from, y_to = st.select_slider("구매 연도 범위", options=years, value=(years[0], years[-1]))
-    pick_states = st.multiselect("STATE(여러 개 선택 가능)", options=state_all, default=[])
+    pick_states = st.multiselect("STATE(다중)", options=all_states, default=[])
     topn = st.slider("Top N 카테고리", 5, 50, 15, 5)
-    chart_type = st.selectbox("월별 추이 차트 타입", options=["line", "bar"], index=0)
-    logscale = st.checkbox("Y축 로그 스케일", value=False, help="분포가 크면 로그 스케일이 보기 좋음")
-    sample_rows = st.number_input("표시용 샘플링(행)", min_value=0, value=0, step=1000, help="0이면 전체")
+    chart_type = st.selectbox("월별 차트", options=["line", "bar"], index=0)
+    logscale = st.checkbox("Y축 로그 스케일", value=False)
+    sample_rows = st.number_input("표시 샘플링(행) — 0은 전체", min_value=0, value=0, step=1000)
     show_sections = st.multiselect(
-        "표시할 섹션", 
+        "표시 섹션",
         ["KPI", "월별 추이", "Top 카테고리", "원시데이터 미리보기", "커스텀 SQL"],
-        default=["KPI", "월별 추이", "Top 카테고리", "커스텀 SQL"]
+        default=["KPI", "월별 추이", "Top 카테고리", "커스텀 SQL"],
     )
     apply = st.form_submit_button("적용")
 
-# 첫 진입 보정
+# 첫 진입 보정: 필터 적용 안 눌러도 동작
 if "applied" not in st.session_state:
     st.session_state.applied = True
     apply = True if not apply else apply
 
-# 공통 WHERE/파라미터
-base_where = ["o.order_purchase_timestamp IS NOT NULL"]
+# 공통 WHERE/파라미터 구성
+base_where = ["o.order_purchase_timestamp IS NOT NULL",
+              "strftime('%Y', o.order_purchase_timestamp) BETWEEN :yf AND :yt"]
 params = {"yf": y_from, "yt": y_to}
-base_where.append("strftime('%Y', o.order_purchase_timestamp) BETWEEN :yf AND :yt")
 
 if pick_states:
-    base_where.append("""
+    # SQLite 텍스트 IN 구성 (UI 선택값만 사용 → 안전)
+    states_str = ",".join(f"'{s}'" for s in pick_states)
+    base_where.append(f"""
         o.customer_id IN (
             SELECT customer_id FROM olist_customers_dataset
-            WHERE customer_state IN (:states)
+            WHERE customer_state IN ({states_str})
         )
     """)
-    # SQLAlchemy 텍스트 파라미터 확장용
-    # 아래에서 :states를 IN (...)로 바꾸지 않고 executemany 스타일로 처리
-    # 간단히 문자열로 구현:
-    states_str = ",".join(f"'{s}'" for s in pick_states)
-    base_where[-1] = base_where[-1].replace(":states", states_str)  # 안전: 목록은 UI선택값
 
 where_sql = "WHERE " + " AND ".join(base_where)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KPI 섹션
+# 4) 메인 헤더
+# ─────────────────────────────────────────────────────────────────────────────
+st.title("🛍️ Olist E-Commerce Explorer (Pro)")
+st.caption("Kaggle → SQLite → Streamlit | 폼 기반 리런 최소화 · SQL 집계 · CSV 내보내기 · 쿼리플랜")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5) KPI
 # ─────────────────────────────────────────────────────────────────────────────
 if "KPI" in show_sections:
-    st.title("🛍️ Olist E-Commerce Explorer (Pro)")
-    st.caption("Kaggle → SQLite → Streamlit, 폼 기반 리런 최소화 · SQL 집계 · 내보내기/디버깅 강화")
-
     kpi_sql = f"""
     SELECT
       (SELECT count(*) FROM olist_orders_dataset o {where_sql}) AS orders_cnt,
       (SELECT sum(p.payment_value)
-       FROM olist_order_payments_dataset p
-       JOIN olist_orders_dataset o USING(order_id) {where_sql}) AS pay_sum,
+         FROM olist_order_payments_dataset p
+         JOIN olist_orders_dataset o USING(order_id) {where_sql}) AS pay_sum,
       (SELECT avg(cnt) FROM (
           SELECT count(*) AS cnt
           FROM olist_order_items_dataset i
@@ -130,25 +124,23 @@ if "KPI" in show_sections:
       )) AS avg_items
     """
     k = q(kpi_sql, params=params).iloc[0]
-
     c1, c2, c3, c4 = st.columns(4)
     with c1: st.metric("주문 수", f"{int(k['orders_cnt'] or 0):,}")
     with c2: st.metric("총 결제액(원화 환산 아님)", f"{float(k['pay_sum'] or 0):,.2f}")
     with c3: st.metric("주문당 아이템 수(평균)", f"{float(k['avg_items'] or 0):.2f}")
     with c4:
-        # 간단히 카테고리 수(제품군 다양성)
-        cat_sql = f"""
+        cats_sql = f"""
         SELECT count(DISTINCT p.product_category_name) AS cats
         FROM olist_order_items_dataset i
         JOIN olist_orders_dataset o USING(order_id)
         JOIN olist_products_dataset p USING(product_id)
         {where_sql}
         """
-        cats = int(q(cat_sql, params=params).iloc[0]["cats"] or 0)
+        cats = int(q(cats_sql, params=params).iloc[0]["cats"] or 0)
         st.metric("카테고리 수(판매기록)", f"{cats:,}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 월별 추이 (주문 수)
+# 6) 월별 추이
 # ─────────────────────────────────────────────────────────────────────────────
 if "월별 추이" in show_sections:
     trend_sql = f"""
@@ -159,17 +151,14 @@ if "월별 추이" in show_sections:
     """
     trend = q(trend_sql, params=params)
     st.subheader("📈 월별 주문 추이")
-    if chart_type == "line":
-        fig = px.line(trend, x="ym", y="orders")
-    else:
-        fig = px.bar(trend, x="ym", y="orders")
+    fig = px.line(trend, x="ym", y="orders") if chart_type == "line" else px.bar(trend, x="ym", y="orders")
     if logscale:
         fig.update_yaxes(type="log")
     st.plotly_chart(fig, use_container_width=True)
-    st.download_button("월별 주문 CSV 다운로드", trend.to_csv(index=False).encode("utf-8"), "monthly_orders.csv")
+    st.download_button("월별 주문 CSV", trend.to_csv(index=False).encode("utf-8"), "monthly_orders.csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Top 카테고리 (판매건수)
+# 7) Top 카테고리
 # ─────────────────────────────────────────────────────────────────────────────
 if "Top 카테고리" in show_sections:
     top_sql = f"""
@@ -188,10 +177,10 @@ if "Top 카테고리" in show_sections:
     if logscale:
         fig2.update_yaxes(type="log")
     st.plotly_chart(fig2, use_container_width=True)
-    st.download_button("Top 카테고리 CSV 다운로드", top_df.to_csv(index=False).encode("utf-8"), "top_categories.csv")
+    st.download_button("Top 카테고리 CSV", top_df.to_csv(index=False).encode("utf-8"), "top_categories.csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 원시데이터 미리보기(옵션, 성능 보호용 샘플링)
+# 8) 원시데이터 미리보기 (샘플링 옵션)
 # ─────────────────────────────────────────────────────────────────────────────
 if "원시데이터 미리보기" in show_sections:
     st.subheader("🧾 원시데이터 미리보기 (orders)")
@@ -204,19 +193,20 @@ if "원시데이터 미리보기" in show_sections:
     ORDER BY o.order_purchase_timestamp
     """
     raw = q(raw_sql, params=params)
+    view = raw
     if sample_rows and sample_rows > 0 and len(raw) > sample_rows:
-        raw = raw.sample(sample_rows, random_state=42).sort_values("order_purchase_timestamp")
-        st.caption(f"※ 전체 {len(raw):,} 중 {sample_rows:,}행 샘플 표시")
-    st.dataframe(raw, use_container_width=True, height=360)
+        view = raw.sample(sample_rows, random_state=42).sort_values("order_purchase_timestamp")
+        st.caption(f"※ 전체 {len(raw):,}행 중 {sample_rows:,}행 샘플 표시")
+    st.dataframe(view, use_container_width=True, height=360)
     st.download_button("주문 원시데이터 CSV", raw.to_csv(index=False).encode("utf-8"), "orders_raw.csv")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 커스텀 SQL (템플릿+실행+쿼리플랜)
+# 9) 커스텀 SQL + EXPLAIN
 # ─────────────────────────────────────────────────────────────────────────────
 if "커스텀 SQL" in show_sections:
     st.subheader("🧪 커스텀 SQL 실행기")
     templates = {
-        "상태별 주문 수": "SELECT order_status, COUNT(*) cnt FROM olist_orders_dataset o GROUP BY 1 ORDER BY 2 DESC",
+        "상태별 주문 수": "SELECT order_status, COUNT(*) cnt FROM olist_orders_dataset GROUP BY 1 ORDER BY 2 DESC",
         "월별 매출(결제합)": """
             SELECT strftime('%Y-%m', o.order_purchase_timestamp) AS ym,
                    SUM(p.payment_value) AS revenue
@@ -224,15 +214,15 @@ if "커스텀 SQL" in show_sections:
             JOIN olist_order_payments_dataset p USING(order_id)
             GROUP BY 1 ORDER BY 1
         """,
-        "카테고리별 평균 주문당 아이템수": """
-            SELECT p.product_category_name,
-                   AVG(s.cnt) AS avg_items_per_order
-            FROM (
+        "카테고리별 주문당 평균 아이템수": """
+            WITH per_order AS (
                 SELECT o.order_id, COUNT(*) AS cnt
                 FROM olist_order_items_dataset i
                 JOIN olist_orders_dataset o USING(order_id)
                 GROUP BY o.order_id
-            ) s
+            )
+            SELECT p.product_category_name, AVG(per_order.cnt) AS avg_items_per_order
+            FROM per_order
             JOIN olist_order_items_dataset i USING(order_id)
             JOIN olist_products_dataset p USING(product_id)
             GROUP BY 1 ORDER BY 2 DESC
@@ -242,7 +232,7 @@ if "커스텀 SQL" in show_sections:
     default_sql = templates[tpl]
     sql = st.text_area("SQL 입력", default_sql, height=200)
 
-    col_run, col_plan, col_dl = st.columns([1,1,2])
+    col_run, col_plan, col_dl = st.columns([1, 1, 2])
     with col_run:
         run = st.button("실행")
     with col_plan:
@@ -253,11 +243,10 @@ if "커스텀 SQL" in show_sections:
     if run:
         try:
             df = q(sql)
+            df_view = df
             if sample_rows and sample_rows > 0 and len(df) > sample_rows:
                 df_view = df.sample(sample_rows, random_state=42)
-                st.caption(f"※ 전체 {len(df):,} 중 {sample_rows:,}행 샘플 표시")
-            else:
-                df_view = df
+                st.caption(f"※ 전체 {len(df):,}행 중 {sample_rows:,}행 샘플 표시")
             st.dataframe(df_view, use_container_width=True, height=420)
             st.download_button("결과 CSV 다운로드", df.to_csv(index=False).encode("utf-8"), file_name=csv_name)
         except Exception as e:
@@ -269,3 +258,8 @@ if "커스텀 SQL" in show_sections:
             st.code(plan.to_string(index=False), language="sql")
         except Exception as e:
             st.error(str(e))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 10) 푸터
+# ─────────────────────────────────────────────────────────────────────────────
+st.caption("© 2025 Olist Demo · Streamlit · SQLite · Kaggle · by Banseok")
