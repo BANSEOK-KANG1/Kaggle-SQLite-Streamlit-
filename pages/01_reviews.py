@@ -2,7 +2,7 @@
 import plotly.express as px
 import streamlit as st
 import pandas as pd
-from models import q, get_years_from
+from db.models import q, get_years_from
 
 st.title("🔎 리뷰 분석")
 
