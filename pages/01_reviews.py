@@ -54,3 +54,7 @@ LIMIT 200
 low = q(low_sql, {"yf": yf, "yt": yt, "min_len": min_len})
 with st.expander("🧯 저평점 리뷰 빠른 스캔(최근 200개)"):
     st.dataframe(low, use_container_width=True, height=360)
+
+if df.empty or not {"ym","avg_score","reviews"}.issubset(df.columns):
+    st.info("해당 구간 리뷰가 없습니다. (DB가 아직 준비 중이거나, 필터에 해당 데이터가 없습니다.)")
+    st.stop()
