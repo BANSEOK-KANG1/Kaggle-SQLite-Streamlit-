@@ -1,18 +1,25 @@
 # scripts/etl.py
 import argparse
-import os
 import zipfile
 from pathlib import Path
 import pandas as pd
-
-# ── Kaggle 자격증명 읽기(st.secrets → env fallback)
+# etl.py 상단
+import os, json
 try:
     import streamlit as st
     KAGGLE_USER = st.secrets.get("kaggle", {}).get("username", os.getenv("KAGGLE_USERNAME", ""))
-    KAGGLE_KEY = st.secrets.get("kaggle", {}).get("key", os.getenv("KAGGLE_KEY", ""))
+    KAGGLE_KEY  = st.secrets.get("kaggle", {}).get("key",      os.getenv("KAGGLE_KEY", ""))
 except Exception:
     KAGGLE_USER = os.getenv("KAGGLE_USERNAME", "")
-    KAGGLE_KEY = os.getenv("KAGGLE_KEY", "")
+    KAGGLE_KEY  = os.getenv("KAGGLE_KEY", "")
+
+if not (KAGGLE_USER and KAGGLE_KEY):
+    cfg = os.path.expanduser("~/.kaggle/kaggle.json")
+    if os.path.exists(cfg):
+        with open(cfg) as f:
+            data = json.load(f)
+            KAGGLE_USER = KAGGLE_USER or data.get("username", "")
+            KAGGLE_KEY  = KAGGLE_KEY  or data.get("key", "")
 
 BASE = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE / "data"
