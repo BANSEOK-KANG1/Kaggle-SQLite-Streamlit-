@@ -1,34 +1,46 @@
-# app.py — Olist E-Commerce Explorer (Cloud-ready)
-from pathlib import Path
+ vfrom pathlib import Path
+import os
 import subprocess
-
-import pandas as pd
-import plotly.express as px
 import streamlit as st
-from sqlalchemy import create_engine, text
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 0) 초기 설정
-# ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Olist E-Commerce Explorer (Pro)", layout="wide")
 DATA_DIR = Path("data")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "olist.sqlite"
 
-# 데이터 폴더 보장
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1) DB 부트스트랩: 없으면 자동 생성 (Kaggle Secrets 필요)
-# ─────────────────────────────────────────────────────────────────────────────
 if not DB_PATH.exists():
     st.warning("⚙️ 데이터베이스가 없습니다. 자동 생성 중… (최초 1~2분)")
+
+    # 1) Streamlit Secrets → ENV로 주입
+    env = os.environ.copy()
     try:
-        # Kaggle Secrets가 Cloud에 설정되어 있어야 함: [kaggle] username/key
-        subprocess.run(["python", "scripts/etl.py", "--download", "--load"], check=True)
-        st.success("✅ 데이터베이스 생성 완료! ▶ 상단 Rerun 버튼으로 다시 실행하세요.")
-    except Exception as e:
-        st.error(f"DB 생성 실패: {e}")
-    st.stop()
+        env["KAGGLE_USERNAME"] = st.secrets["kaggle"]["username"]
+        env["KAGGLE_KEY"] = st.secrets["kaggle"]["key"]
+    except Exception:
+        st.error("Kaggle Secrets가 없습니다. Manage app → Settings → Secrets 에서 [kaggle] username/key를 설정하세요.")
+        st.stop()
+
+    # 2) etl.py 실행 + 로그 캡처(디버그용)
+    try:
+        proc = subprocess.run(
+            ["python", "scripts/etl.py", "--download", "--load"],
+            check=True,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        st.success("✅ 데이터베이스 생성 완료! 상단 Rerun 버튼으로 다시 실행하세요.")
+        if proc.stdout:
+            with st.expander("설치/적재 로그 보기 (stdout)"):
+                st.code(proc.stdout)
+        st.stop()
+    except subprocess.CalledProcessError as e:
+        st.error("DB 생성 실패: etl.py 실행 중 오류가 발생했습니다.")
+        with st.expander("오류 로그 상세 (stderr)"):
+            st.code(e.stderr or "(stderr 비어있음)")
+        with st.expander("표준 출력 (stdout)"):
+            st.code(e.stdout or "(stdout 비어있음)")
+        st.stop()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 2) 캐시 헬퍼(엔진/쿼리)
