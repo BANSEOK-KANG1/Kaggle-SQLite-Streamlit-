@@ -1,49 +1,233 @@
-from pathlib import Path
-import os
-import subprocess
-import streamlit as st
+# app.py — All-in-one (Kaggle → SQLite → Streamlit)
+# - 첫 실행 시: Kaggle에서 데이터 자동 다운로드 → SQLite 적재 → 인덱스/뷰 생성
+# - 이후: 대시보드 렌더링
+# 배포 전 필수: Streamlit Cloud Secrets에 아래 저장
+# [kaggle]
+# username = "YOUR_KAGGLE_USERNAME"
+# key = "YOUR_KAGGLE_KEY"
 
-DATA_DIR = Path("data")
+from pathlib import Path
+import os, json
+import sqlite3
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+from sqlalchemy import create_engine, text
+from kaggle.api.kaggle_api_extended import KaggleApi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 0) 기본 설정
+# ─────────────────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Olist E-Commerce Explorer (All-in-One)", layout="wide")
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = DATA_DIR / "olist.sqlite"
 
-if not DB_PATH.exists():
-    st.warning("⚙️ 데이터베이스가 없습니다. 자동 생성 중… (최초 1~2분)")
-
-    # 1) Streamlit Secrets → ENV로 주입
-    env = os.environ.copy()
-    try:
-        env["KAGGLE_USERNAME"] = st.secrets["kaggle"]["username"]
-        env["KAGGLE_KEY"] = st.secrets["kaggle"]["key"]
-    except Exception:
-        st.error("Kaggle Secrets가 없습니다. Manage app → Settings → Secrets 에서 [kaggle] username/key를 설정하세요.")
-        st.stop()
-
-    # 2) etl.py 실행 + 로그 캡처(디버그용)
-    try:
-        proc = subprocess.run(
-            ["python", "scripts/etl.py", "--download", "--load"],
-            check=True,
-            env=env,
-            capture_output=True,
-            text=True,
-        )
-        st.success("✅ 데이터베이스 생성 완료! 상단 Rerun 버튼으로 다시 실행하세요.")
-        if proc.stdout:
-            with st.expander("설치/적재 로그 보기 (stdout)"):
-                st.code(proc.stdout)
-        st.stop()
-    except subprocess.CalledProcessError as e:
-        st.error("DB 생성 실패: etl.py 실행 중 오류가 발생했습니다.")
-        with st.expander("오류 로그 상세 (stderr)"):
-            st.code(e.stderr or "(stderr 비어있음)")
-        with st.expander("표준 출력 (stdout)"):
-            st.code(e.stdout or "(stdout 비어있음)")
-        st.stop()
-
+DATASET_SLUG = "olistbr/brazilian-ecommerce"
+CSV_FILES = [
+    "olist_customers_dataset.csv",
+    "olist_orders_dataset.csv",
+    "olist_order_items_dataset.csv",
+    "olist_order_payments_dataset.csv",
+    "olist_order_reviews_dataset.csv",
+    "olist_products_dataset.csv",
+    "olist_sellers_dataset.csv",
+    "olist_geolocation_dataset.csv",
+    "product_category_name_translation.csv",
+]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2) 캐시 헬퍼(엔진/쿼리)
+# 1) Kaggle 자격증명 로딩 (st.secrets → ENV → ~/.kaggle/kaggle.json)
+# ─────────────────────────────────────────────────────────────────────────────
+def load_kaggle_credentials() -> tuple[str, str]:
+    user = key = ""
+    try:
+        user = st.secrets.get("kaggle", {}).get("username", "")
+        key  = st.secrets.get("kaggle", {}).get("key", "")
+    except Exception:
+        pass
+    user = user or os.getenv("KAGGLE_USERNAME", "")
+    key  = key  or os.getenv("KAGGLE_KEY", "")
+    if not (user and key):
+        cfg = Path.home() / ".kaggle" / "kaggle.json"
+        if cfg.exists():
+            with cfg.open() as f:
+                data = json.load(f)
+                user = user or data.get("username", "")
+                key  = key  or data.get("key", "")
+    return user, key
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2) ETL 유틸
+# ─────────────────────────────────────────────────────────────────────────────
+def kaggle_download_unzip():
+    """Kaggle Python API로 데이터셋 다운로드 및 자동 압축해제."""
+    user, key = load_kaggle_credentials()
+    if not (user and key):
+        raise RuntimeError(
+            "Kaggle API 자격증명이 없습니다. "
+            "Streamlit Secrets([kaggle] username/key) 또는 환경변수/ ~/.kaggle/kaggle.json 설정이 필요합니다."
+        )
+    os.environ["KAGGLE_USERNAME"] = user
+    os.environ["KAGGLE_KEY"] = key
+    api = KaggleApi()
+    api.authenticate()
+    api.dataset_download_files(DATASET_SLUG, path=str(DATA_DIR), unzip=True)
+    # 최소 CSV 몇 개가 실제로 생겼는지 점검
+    has_any = any((DATA_DIR / name).exists() for name in CSV_FILES)
+    if not has_any:
+        raise FileNotFoundError("Kaggle 다운로드 후 CSV 파일을 찾지 못했습니다. 네트워크/권한을 확인하세요.")
+
+def load_to_sqlite():
+    """CSV → SQLite 적재(replace) + 성능 PRAGMA."""
+    missing = [n for n in CSV_FILES if not (DATA_DIR / n).exists()]
+    if missing:
+        raise FileNotFoundError(
+            "다음 CSV가 없습니다. Kaggle 다운로드가 실패했을 가능성이 큽니다:\n  - " + "\n  - ".join(missing)
+        )
+
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.executescript(
+        """
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+        PRAGMA temp_store=MEMORY;
+        """
+    )
+    con.commit()
+
+    for name in CSV_FILES:
+        df = pd.read_csv(DATA_DIR / name)
+        table = name.replace(".csv", "")
+        df.to_sql(table, con, if_exists="replace", index=False)
+        print(f"{table}: {len(df):,} rows 적재")
+
+    con.commit()
+    con.close()
+
+def _table_exists(con, name: str) -> bool:
+    cur = con.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+    return cur.fetchone() is not None
+
+def create_indexes():
+    """조회 성능 향상을 위한 인덱스."""
+    con = sqlite3.connect(DB_PATH)
+    required = [
+        "olist_orders_dataset",
+        "olist_order_items_dataset",
+        "olist_order_payments_dataset",
+        "olist_customers_dataset",
+        "olist_products_dataset",
+    ]
+    missing = [t for t in required if not _table_exists(con, t)]
+    if missing:
+        con.close()
+        raise RuntimeError("인덱스 생성 실패: 테이블이 없습니다 → " + ", ".join(missing))
+
+    cur = con.cursor()
+    cur.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_orders_ts
+            ON olist_orders_dataset(order_purchase_timestamp);
+        CREATE INDEX IF NOT EXISTS idx_orders_id
+            ON olist_orders_dataset(order_id);
+        CREATE INDEX IF NOT EXISTS idx_items_order
+            ON olist_order_items_dataset(order_id);
+        CREATE INDEX IF NOT EXISTS idx_items_product
+            ON olist_order_items_dataset(product_id);
+        CREATE INDEX IF NOT EXISTS idx_pay_order
+            ON olist_order_payments_dataset(order_id);
+        CREATE INDEX IF NOT EXISTS idx_cust_id_state
+            ON olist_customers_dataset(customer_id, customer_state);
+        ANALYZE;
+        """
+    )
+    con.commit()
+    con.close()
+
+def create_views():
+    """분석용 뷰 생성: 결제합·리드타임·RFM."""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.executescript(
+        """
+        -- 주문별 결제 합계
+        CREATE VIEW IF NOT EXISTS vw_order_payment_sum AS
+        SELECT p.order_id, SUM(p.payment_value) AS payment_total
+        FROM olist_order_payments_dataset p
+        GROUP BY p.order_id;
+
+        -- 구매~배송 리드타임(일)
+        CREATE VIEW IF NOT EXISTS vw_order_lead_time AS
+        SELECT
+          o.order_id,
+          o.customer_id,
+          o.order_purchase_timestamp,
+          o.order_delivered_customer_date,
+          CAST(
+            (julianday(o.order_delivered_customer_date) - julianday(o.order_purchase_timestamp))
+            AS REAL
+          ) AS lead_time_days
+        FROM olist_orders_dataset o
+        WHERE o.order_delivered_customer_date IS NOT NULL
+          AND o.order_purchase_timestamp IS NOT NULL;
+
+        -- RFM 기본 집계(고객별 Recency/Frequency/Monetary)
+        CREATE VIEW IF NOT EXISTS vw_rfm_base AS
+        WITH last_date AS (
+          SELECT MAX(order_delivered_customer_date) AS max_delivered
+          FROM olist_orders_dataset
+          WHERE order_delivered_customer_date IS NOT NULL
+        ),
+        order_money AS (
+          SELECT
+            o.order_id,
+            o.customer_id,
+            o.order_delivered_customer_date,
+            COALESCE(s.payment_total, 0) AS monetary
+          FROM olist_orders_dataset o
+          LEFT JOIN vw_order_payment_sum s USING(order_id)
+          WHERE o.order_delivered_customer_date IS NOT NULL
+        )
+        SELECT
+          m.customer_id,
+          CAST(julianday(l.max_delivered) - julianday(MAX(m.order_delivered_customer_date)) AS INTEGER) AS recency_days,
+          COUNT(DISTINCT m.order_id) AS frequency,
+          SUM(m.monetary) AS monetary
+        FROM order_money m
+        CROSS JOIN last_date l
+        GROUP BY m.customer_id;
+        """
+    )
+    con.commit()
+    con.close()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3) 최초 실행 시 자동 ETL(동일 프로세스에서 수행)
+# ─────────────────────────────────────────────────────────────────────────────
+if not DB_PATH.exists():
+    with st.status("⚙️ 데이터베이스가 없습니다. 자동 생성 중… (최초 1~2분)", expanded=True) as s:
+        try:
+            st.write("1) Kaggle에서 데이터 다운로드 및 압축해제…")
+            kaggle_download_unzip()
+            st.write("2) CSV → SQLite 적재…")
+            load_to_sqlite()
+            st.write("3) 인덱스 생성…")
+            create_indexes()
+            st.write("4) 분석용 뷰 생성…")
+            create_views()
+            s.update(label="✅ 데이터베이스 생성 완료. 상단 Rerun 버튼으로 다시 실행하세요.", state="complete")
+        except Exception as e:
+            s.update(label="❌ DB 생성 실패", state="error")
+            st.error(str(e))
+        st.stop()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4) 쿼리 캐시/엔진
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_engine():
@@ -56,10 +240,9 @@ def q(sql: str, params: dict | None = None) -> pd.DataFrame:
         return pd.read_sql(text(sql), conn, params=params or {})
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3) 사이드바: 글로벌 필터 (폼으로 리런 최소화)
+# 5) 사이드바 필터
 # ─────────────────────────────────────────────────────────────────────────────
 st.sidebar.header("🔧 글로벌 필터")
-
 years_df = q("""
     SELECT DISTINCT strftime('%Y', order_purchase_timestamp) AS y
     FROM olist_orders_dataset
@@ -90,18 +273,14 @@ with st.sidebar.form("filters", clear_on_submit=False):
     )
     apply = st.form_submit_button("적용")
 
-# 첫 진입 보정: 필터 적용 안 눌러도 동작
 if "applied" not in st.session_state:
     st.session_state.applied = True
     apply = True if not apply else apply
 
-# 공통 WHERE/파라미터 구성
 base_where = ["o.order_purchase_timestamp IS NOT NULL",
               "strftime('%Y', o.order_purchase_timestamp) BETWEEN :yf AND :yt"]
 params = {"yf": y_from, "yt": y_to}
-
 if pick_states:
-    # SQLite 텍스트 IN 구성 (UI 선택값만 사용 → 안전)
     states_str = ",".join(f"'{s}'" for s in pick_states)
     base_where.append(f"""
         o.customer_id IN (
@@ -109,18 +288,15 @@ if pick_states:
             WHERE customer_state IN ({states_str})
         )
     """)
-
 where_sql = "WHERE " + " AND ".join(base_where)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4) 메인 헤더
+# 6) 메인 화면
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("🛍️ Olist E-Commerce Explorer (Pro)")
-st.caption("Kaggle → SQLite → Streamlit | 폼 기반 리런 최소화 · SQL 집계 · CSV 내보내기 · 쿼리플랜")
+st.title("🛍️ Olist E-Commerce Explorer (All-in-One)")
+st.caption("Kaggle → SQLite → Streamlit | 최초 실행 자동 ETL · 캐시 · 커스텀 SQL · CSV 내보내기")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 5) KPI
-# ─────────────────────────────────────────────────────────────────────────────
+# KPI
 if "KPI" in show_sections:
     kpi_sql = f"""
     SELECT
@@ -151,9 +327,7 @@ if "KPI" in show_sections:
         cats = int(q(cats_sql, params=params).iloc[0]["cats"] or 0)
         st.metric("카테고리 수(판매기록)", f"{cats:,}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 6) 월별 추이
-# ─────────────────────────────────────────────────────────────────────────────
+# 월별 추이
 if "월별 추이" in show_sections:
     trend_sql = f"""
     SELECT strftime('%Y-%m', o.order_purchase_timestamp) AS ym, count(*) AS orders
@@ -169,9 +343,7 @@ if "월별 추이" in show_sections:
     st.plotly_chart(fig, use_container_width=True)
     st.download_button("월별 주문 CSV", trend.to_csv(index=False).encode("utf-8"), "monthly_orders.csv")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 7) Top 카테고리
-# ─────────────────────────────────────────────────────────────────────────────
+# Top 카테고리
 if "Top 카테고리" in show_sections:
     top_sql = f"""
     SELECT p.product_category_name AS category, count(*) AS cnt
@@ -191,9 +363,7 @@ if "Top 카테고리" in show_sections:
     st.plotly_chart(fig2, use_container_width=True)
     st.download_button("Top 카테고리 CSV", top_df.to_csv(index=False).encode("utf-8"), "top_categories.csv")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 8) 원시데이터 미리보기 (샘플링 옵션)
-# ─────────────────────────────────────────────────────────────────────────────
+# 원시데이터 미리보기
 if "원시데이터 미리보기" in show_sections:
     st.subheader("🧾 원시데이터 미리보기 (orders)")
     raw_sql = f"""
@@ -212,9 +382,7 @@ if "원시데이터 미리보기" in show_sections:
     st.dataframe(view, use_container_width=True, height=360)
     st.download_button("주문 원시데이터 CSV", raw.to_csv(index=False).encode("utf-8"), "orders_raw.csv")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 9) 커스텀 SQL + EXPLAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# 커스텀 SQL
 if "커스텀 SQL" in show_sections:
     st.subheader("🧪 커스텀 SQL 실행기")
     templates = {
@@ -271,7 +439,5 @@ if "커스텀 SQL" in show_sections:
         except Exception as e:
             st.error(str(e))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 10) 푸터
-# ─────────────────────────────────────────────────────────────────────────────
+# 푸터
 st.caption("© 2025 Olist Demo · Streamlit · SQLite · Kaggle · by Banseok")
