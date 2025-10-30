@@ -20,6 +20,7 @@ if not DB_PATH.exists():
 # app.py (핸들링 확장판)
 from pathlib import Path
 import pandas as pd
+from pathlib import Path
 import plotly.express as px
 import streamlit as st
 from sqlalchemy import create_engine, text
