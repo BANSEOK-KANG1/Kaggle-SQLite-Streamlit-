@@ -4,21 +4,35 @@ from sqlalchemy import create_engine, text
 from pathlib import Path
 import plotly.express as px
 
-DB_PATH = Path(__file__).resolve().parents[1] / "data" / "olist.sqlite"
-
+# --- 상단 import와 경로는 그대로 두고, q()를 아래처럼 교체 ---
 @st.cache_resource
 def eng():
     return create_engine(f"sqlite:///{DB_PATH}", future=True)
 
-@st.cache_data(ttl=1800)
-def q(sql, params=None):
-    with eng().begin() as c:
-        return pd.read_sql(text(sql), c, params or {})
+@st.cache_data(ttl=900)
+def q(sql: str, params: dict | None = None) -> pd.DataFrame:
+    """읽기 전용 쿼리. 실패 시 sqlite3로 폴백."""
+    params = params or {}
+    try:
+        with eng().begin() as c:
+            return pd.read_sql(text(sql), c, params=params)
+    except Exception as e:
+        # 폴백: sqlite3로 동일 쿼리 시도
+        import sqlite3
+        with sqlite3.connect(DB_PATH) as con:
+            df = pd.read_sql_query(sql, con, params=params)
+        return df
 
-st.title("👥 RFM Segments")
-
-years = q("SELECT DISTINCT strftime('%Y', order_purchase_timestamp) y FROM olist_orders_dataset WHERE order_purchase_timestamp IS NOT NULL ORDER BY 1")["y"].dropna().tolist() or ["2016","2017","2018"]
+# --- 연도 목록 생성도 방어적으로 ---
+_years_df = q("""
+    SELECT DISTINCT strftime('%Y', order_purchase_timestamp) AS y
+    FROM olist_orders_dataset
+    WHERE order_purchase_timestamp IS NOT NULL
+    ORDER BY 1
+""")
+years = (_years_df["y"].dropna().astype(str).tolist()) if not _years_df.empty else ["2016","2017","2018"]
 yf, yt = st.sidebar.select_slider("Delivered year range", options=years, value=(years[0], years[-1]))
+
 states = st.sidebar.text_input("States (comma-separated, e.g., SP,RJ)", "").strip()
 
 where = ["strftime('%Y', o.order_purchase_timestamp) BETWEEN :yf AND :yt"]
