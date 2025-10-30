@@ -12,6 +12,12 @@ import sqlite3
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+st.set_page_config(page_title="Olist E-Commerce Explorer (All-in-One)", layout="wide")
+
+st.title("🏠 Olist E-Commerce Explorer")
+st.caption("Kaggle → SQLite → Streamlit")
+st.write("좌측 메뉴에서 **Reviews** 또는 **RFM Segments**를 선택하세요.")
+
 from sqlalchemy import create_engine, text
 from kaggle.api.kaggle_api_extended import KaggleApi
 
