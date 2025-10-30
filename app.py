@@ -1,3 +1,22 @@
+# app.py 맨 위 import 아래쪽에 추가
+import subprocess
+
+DB_PATH = Path("data/olist.sqlite")
+if not DB_PATH.exists():
+    st.warning("⚙️ 데이터베이스가 없습니다. 자동 생성 중... (처음 1~2분 소요)")
+    try:
+        subprocess.run(
+            ["python", "scripts/etl.py", "--download", "--load"],
+            check=True
+        )
+        st.success("✅ 데이터베이스 생성 완료! 앱을 다시 실행하세요.")
+        st.stop()
+    except Exception as e:
+        st.error(f"DB 생성 실패: {e}")
+        st.stop()
+
+
+
 # app.py (핸들링 확장판)
 from pathlib import Path
 import pandas as pd
