@@ -19,11 +19,13 @@ if not DB_PATH.exists():
 
 # app.py (핸들링 확장판)
 from pathlib import Path
-import pandas as pd
-from pathlib import Path
-import plotly.express as px
 import streamlit as st
+import subprocess
+import plotly.express as px
+import pandas as pd
 from sqlalchemy import create_engine, text
+
+
 
 st.set_page_config(page_title="Olist E-Commerce Explorer (Pro)", layout="wide")
 
